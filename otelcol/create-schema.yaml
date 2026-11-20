@@ -1,0 +1,284 @@
+# =============================================================================
+# OTel logs + traces 스키마 초기화 Job (Altinity CHI otel-ch, cluster logs 3 x 2)
+#
+#  initContainer (run.sh wait): 6개 파드가 응답·클러스터 구성 반영·Keeper 연결을 연속 3회 만족할 때까지 대기
+#  container     (run.sh init): DB(default, ltp_svc, ltp_audit, ltp_infra)별로
+#                               7개 객체가 모든 호스트에 있으면 Skip, 없으면 ON CLUSTER 로 생성 후 검증
+#
+#  DB별 객체: otel_logs_local / otel_logs(Distributed)
+#            otel_traces_local / otel_traces(Distributed)
+#            otel_traces_trace_id_ts_local / _mv / otel_traces_trace_id_ts(Distributed)
+#  접속 계정 Secret(otel-schema-init-credentials)은 clickhouse-cluster.yaml 에 정의
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-logs-schema
+  namespace: clickhouse
+data:
+  # __CLUSTER__, __DB__, __TTL_DAYS__ 는 run.sh 에서 치환
+  schema.sql: |
+    CREATE DATABASE IF NOT EXISTS __DB__ ON CLUSTER '__CLUSTER__';
+
+    -- 각 shard/replica 의 로컬 테이블 (복제)
+    CREATE TABLE IF NOT EXISTS __DB__.otel_logs_local ON CLUSTER '__CLUSTER__'
+    (
+        Timestamp          DateTime64(9) CODEC(Delta(8), ZSTD(1)),
+        TimestampTime      DateTime DEFAULT toDateTime(Timestamp),
+        TraceId            String CODEC(ZSTD(1)),
+        SpanId             String CODEC(ZSTD(1)),
+        TraceFlags         UInt8,
+        SeverityText       LowCardinality(String) CODEC(ZSTD(1)),
+        SeverityNumber     UInt8,
+        ServiceName        LowCardinality(String) CODEC(ZSTD(1)),
+        Body               String CODEC(ZSTD(1)),
+        ResourceSchemaUrl  LowCardinality(String) CODEC(ZSTD(1)),
+        ResourceAttributes Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+        ScopeSchemaUrl     LowCardinality(String) CODEC(ZSTD(1)),
+        ScopeName          String CODEC(ZSTD(1)),
+        ScopeVersion       LowCardinality(String) CODEC(ZSTD(1)),
+        ScopeAttributes    Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+        LogAttributes      Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+        EventName          String CODEC(ZSTD(1)),
+
+        INDEX idx_trace_id         TraceId                    TYPE bloom_filter(0.001) GRANULARITY 1,
+        INDEX idx_res_attr_key     mapKeys(ResourceAttributes)   TYPE bloom_filter(0.01) GRANULARITY 1,
+        INDEX idx_res_attr_value   mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+        INDEX idx_scope_attr_key   mapKeys(ScopeAttributes)      TYPE bloom_filter(0.01) GRANULARITY 1,
+        INDEX idx_scope_attr_value mapValues(ScopeAttributes)    TYPE bloom_filter(0.01) GRANULARITY 1,
+        INDEX idx_log_attr_key     mapKeys(LogAttributes)        TYPE bloom_filter(0.01) GRANULARITY 1,
+        INDEX idx_log_attr_value   mapValues(LogAttributes)      TYPE bloom_filter(0.01) GRANULARITY 1,
+        INDEX idx_body             Body                       TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 8
+    )
+    ENGINE = ReplicatedMergeTree('/clickhouse/tables/{cluster}/{shard}/{database}/{table}', '{replica}')
+    PARTITION BY toDate(TimestampTime)
+    PRIMARY KEY (ServiceName, TimestampTime)
+    ORDER BY (ServiceName, TimestampTime, Timestamp)
+    TTL TimestampTime + toIntervalDay(__TTL_DAYS__)
+    SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1;
+
+    -- Collector 가 INSERT 하고 조회하는 진입점 (모든 호스트에 생성)
+    CREATE TABLE IF NOT EXISTS __DB__.otel_logs ON CLUSTER '__CLUSTER__'
+    (
+        Timestamp          DateTime64(9),
+        TimestampTime      DateTime DEFAULT toDateTime(Timestamp),
+        TraceId            String,
+        SpanId             String,
+        TraceFlags         UInt8,
+        SeverityText       LowCardinality(String),
+        SeverityNumber     UInt8,
+        ServiceName        LowCardinality(String),
+        Body               String,
+        ResourceSchemaUrl  LowCardinality(String),
+        ResourceAttributes Map(LowCardinality(String), String),
+        ScopeSchemaUrl     LowCardinality(String),
+        ScopeName          String,
+        ScopeVersion       LowCardinality(String),
+        ScopeAttributes    Map(LowCardinality(String), String),
+        LogAttributes      Map(LowCardinality(String), String),
+        EventName          String
+    )
+    ENGINE = Distributed('__CLUSTER__', '__DB__', 'otel_logs_local', rand());
+
+    -- =========================================================================
+    -- Traces
+    -- =========================================================================
+    -- 각 shard/replica 의 로컬 span 테이블 (복제)
+    CREATE TABLE IF NOT EXISTS __DB__.otel_traces_local ON CLUSTER '__CLUSTER__'
+    (
+        Timestamp          DateTime64(9) CODEC(Delta(8), ZSTD(1)),
+        TraceId            String CODEC(ZSTD(1)),
+        SpanId             String CODEC(ZSTD(1)),
+        ParentSpanId       String CODEC(ZSTD(1)),
+        TraceState         String CODEC(ZSTD(1)),
+        SpanName           LowCardinality(String) CODEC(ZSTD(1)),
+        SpanKind           LowCardinality(String) CODEC(ZSTD(1)),
+        ServiceName        LowCardinality(String) CODEC(ZSTD(1)),
+        ResourceAttributes Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+        ScopeName          String CODEC(ZSTD(1)),
+        ScopeVersion       String CODEC(ZSTD(1)),
+        SpanAttributes     Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+        Duration           UInt64 CODEC(ZSTD(1)),
+        StatusCode         LowCardinality(String) CODEC(ZSTD(1)),
+        StatusMessage      String CODEC(ZSTD(1)),
+        Events Nested (
+            Timestamp  DateTime64(9),
+            Name       LowCardinality(String),
+            Attributes Map(LowCardinality(String), String)
+        ) CODEC(ZSTD(1)),
+        Links Nested (
+            TraceId    String,
+            SpanId     String,
+            TraceState String,
+            Attributes Map(LowCardinality(String), String)
+        ) CODEC(ZSTD(1)),
+
+        INDEX idx_trace_id        TraceId                       TYPE bloom_filter(0.001) GRANULARITY 1,
+        INDEX idx_res_attr_key    mapKeys(ResourceAttributes)   TYPE bloom_filter(0.01) GRANULARITY 1,
+        INDEX idx_res_attr_value  mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+        INDEX idx_span_attr_key   mapKeys(SpanAttributes)       TYPE bloom_filter(0.01) GRANULARITY 1,
+        INDEX idx_span_attr_value mapValues(SpanAttributes)     TYPE bloom_filter(0.01) GRANULARITY 1,
+        INDEX idx_duration        Duration                      TYPE minmax GRANULARITY 1
+    )
+    ENGINE = ReplicatedMergeTree('/clickhouse/tables/{cluster}/{shard}/{database}/{table}', '{replica}')
+    PARTITION BY toDate(Timestamp)
+    ORDER BY (ServiceName, SpanName, toDateTime(Timestamp))
+    TTL toDateTime(Timestamp) + toIntervalDay(__TTL_DAYS__)
+    SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1;
+
+    -- span 분산 테이블: 같은 trace 의 span 이 한 shard 에 모이도록 TraceId 로 샤딩
+    CREATE TABLE IF NOT EXISTS __DB__.otel_traces ON CLUSTER '__CLUSTER__'
+    (
+        Timestamp          DateTime64(9),
+        TraceId            String,
+        SpanId             String,
+        ParentSpanId       String,
+        TraceState         String,
+        SpanName           LowCardinality(String),
+        SpanKind           LowCardinality(String),
+        ServiceName        LowCardinality(String),
+        ResourceAttributes Map(LowCardinality(String), String),
+        ScopeName          String,
+        ScopeVersion       String,
+        SpanAttributes     Map(LowCardinality(String), String),
+        Duration           UInt64,
+        StatusCode         LowCardinality(String),
+        StatusMessage      String,
+        Events Nested (
+            Timestamp  DateTime64(9),
+            Name       LowCardinality(String),
+            Attributes Map(LowCardinality(String), String)
+        ),
+        Links Nested (
+            TraceId    String,
+            SpanId     String,
+            TraceState String,
+            Attributes Map(LowCardinality(String), String)
+        )
+    )
+    ENGINE = Distributed('__CLUSTER__', '__DB__', 'otel_traces_local', cityHash64(TraceId));
+
+    -- TraceId -> 시작/종료 시각 조회용 로컬 테이블 (복제)
+    CREATE TABLE IF NOT EXISTS __DB__.otel_traces_trace_id_ts_local ON CLUSTER '__CLUSTER__'
+    (
+        TraceId String CODEC(ZSTD(1)),
+        Start   DateTime CODEC(Delta(4), ZSTD(1)),
+        End     DateTime CODEC(Delta(4), ZSTD(1)),
+        INDEX idx_trace_id TraceId TYPE bloom_filter(0.01) GRANULARITY 1
+    )
+    ENGINE = ReplicatedMergeTree('/clickhouse/tables/{cluster}/{shard}/{database}/{table}', '{replica}')
+    PARTITION BY toDate(Start)
+    ORDER BY (TraceId, Start)
+    TTL Start + toIntervalDay(__TTL_DAYS__)
+    SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1;
+
+    -- 로컬 span 테이블 INSERT 시 trace_id_ts_local 을 채우는 MV (각 호스트에 생성)
+    CREATE MATERIALIZED VIEW IF NOT EXISTS __DB__.otel_traces_trace_id_ts_mv ON CLUSTER '__CLUSTER__'
+    TO __DB__.otel_traces_trace_id_ts_local
+    AS SELECT
+        TraceId,
+        min(toDateTime(Timestamp)) AS Start,
+        max(toDateTime(Timestamp)) AS End
+    FROM __DB__.otel_traces_local
+    WHERE TraceId != ''
+    GROUP BY TraceId;
+
+    -- trace_id_ts 분산 테이블 (Grafana 등 조회용, otel_traces 와 같은 샤딩 키)
+    CREATE TABLE IF NOT EXISTS __DB__.otel_traces_trace_id_ts ON CLUSTER '__CLUSTER__'
+    (
+        TraceId String,
+        Start   DateTime,
+        End     DateTime
+    )
+    ENGINE = Distributed('__CLUSTER__', '__DB__', 'otel_traces_trace_id_ts_local', cityHash64(TraceId));
+
+  # 공통 스크립트: wait = 6개 파드 준비 대기 (initContainer), init = DB별 스키마 생성 (main)
+  run.sh: |
+    #!/bin/sh
+    set -eu
+    HOSTS_N=$((SHARDS * REPLICAS))
+    OBJS="'otel_logs_local','otel_logs','otel_traces_local','otel_traces','otel_traces_trace_id_ts_local','otel_traces_trace_id_ts','otel_traces_trace_id_ts_mv'"
+    ch() { clickhouse-client --host "$1" --port 9000 --user "$CH_USER" --password "$CH_PASSWORD" --connect_timeout 3 -q "$2"; }
+
+    # 파드별: 응답 + 클러스터 구성(6호스트) 반영 + Keeper 연결 확인, 연속 3회 성공 시 통과
+    wait_ready() {
+      ok=0
+      while [ "$ok" -lt 3 ]; do
+        ok=$((ok + 1))
+        for s in $(seq 0 $((SHARDS - 1))); do for r in $(seq 0 $((REPLICAS - 1))); do
+          h="chi-${CHI_NAME}-${CLUSTER}-${s}-${r}"
+          n=$(ch "$h" "SELECT count() FROM system.clusters WHERE cluster='${CLUSTER}'
+                       AND (SELECT count() FROM system.zookeeper WHERE path='/') > 0" 2>/dev/null || echo 0)
+          [ "$n" = "$HOSTS_N" ] || { echo "[wait] $h not ready"; ok=0; }
+        done; done
+        sleep 10
+      done
+      echo "[wait] all ${HOSTS_N} hosts ready"
+    }
+
+    # DB별: 모든 호스트에 7개 객체가 있으면 Skip, 아니면 ON CLUSTER 로 생성 후 검증
+    init_schema() {
+      for DB in $DBS; do
+        cnt() { ch "$CH_HOST" "SELECT count() FROM clusterAllReplicas('${CLUSTER}', system.tables) WHERE database='${DB}' AND name IN (${OBJS})"; }
+        if [ "$(cnt)" -ge $((HOSTS_N * 7)) ]; then echo "[init][$DB] exists - skip"; continue; fi
+        sed -e "s/__CLUSTER__/${CLUSTER}/g; s/__DB__/${DB}/g; s/__TTL_DAYS__/${TTL_DAYS}/g" /schema/schema.sql |
+          clickhouse-client --host "$CH_HOST" --user "$CH_USER" --password "$CH_PASSWORD" \
+            --multiquery --distributed_ddl_task_timeout=600
+        [ "$(cnt)" -ge $((HOSTS_N * 7)) ] || { echo "[init][$DB] verify failed"; exit 1; }
+        echo "[init][$DB] created"
+      done
+    }
+
+    case "$1" in wait) wait_ready ;; init) init_schema ;; esac
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: otel-logs-schema-init
+  namespace: clickhouse
+spec:
+  backoffLimit: 10
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      initContainers:
+        - name: wait-for-clickhouse
+          image: clickhouse/clickhouse-server:25.8
+          command: ["/bin/sh", "/schema/run.sh", "wait"]
+          envFrom:
+            - configMapRef: {name: otel-logs-schema-env}
+          env: &creds
+            - name: CH_USER
+              valueFrom: {secretKeyRef: {name: otel-schema-init-credentials, key: user}}
+            - name: CH_PASSWORD
+              valueFrom: {secretKeyRef: {name: otel-schema-init-credentials, key: password}}
+          volumeMounts: [{name: schema, mountPath: /schema}]
+      containers:
+        - name: schema-init
+          image: clickhouse/clickhouse-server:25.8
+          command: ["/bin/sh", "/schema/run.sh", "init"]
+          envFrom:
+            - configMapRef: {name: otel-logs-schema-env}
+          env: *creds
+          volumeMounts: [{name: schema, mountPath: /schema}]
+      volumes:
+        - name: schema
+          configMap: {name: otel-logs-schema}
+---
+# 환경 설정 (CHI 이름, 클러스터, 레이아웃, 대상 DB)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-logs-schema-env
+  namespace: clickhouse
+data:
+  CHI_NAME: otel-ch
+  CLUSTER: logs
+  CH_HOST: clickhouse-otel-ch          # 오퍼레이터가 만드는 CHI 서비스
+  SHARDS: "3"
+  REPLICAS: "2"
+  DBS: "default ltp_svc ltp_audit ltp_infra"
+  TTL_DAYS: "7"

@@ -1,0 +1,193 @@
+# =============================================================================
+# ClickHouse 3 shards x 2 replicas cluster (Altinity ClickHouse Operator 0.23+)
+#
+#   - Secret                     : 사용자 비밀번호
+#   - ClickHouseKeeperInstallation: Keeper 3노드 (ReplicatedMergeTree / ON CLUSTER 용)
+#   - ClickHouseInstallation     : otel-ch / cluster "logs" (3 x 2)
+#
+#   사용자
+#     default      : 비밀번호만 Secret 으로 설정 (operator 기본 네트워크 제한 유지)
+#     schema_admin : 스키마 초기화 Job 용 (DDL / ON CLUSTER)
+#     ltp_svc      : ltp_svc DB 전용
+#     ltp_audit    : ltp_audit DB 전용
+#     ltp_infra    : ltp_infra DB 전용
+#
+#   적용 순서: 이 파일 -> otel-logs-schema-job.yaml (한 번에 apply 해도 Job 이 대기함)
+#   환경에 맞게 바꿀 값: namespace, 이미지 버전, storageClass/용량, 리소스, 허용 네트워크
+# =============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: clickhouse-user-passwords
+  namespace: clickhouse
+type: Opaque
+stringData:
+  # 실제 환경에서는 External Secrets / Sealed Secrets 등으로 주입 권장
+  default: change-me-default
+  ltp_svc: change-me-ltp-svc
+  ltp_audit: change-me-ltp-audit
+  ltp_infra: change-me-ltp-infra
+---
+# 스키마 초기화 Job 과 CHI 의 schema_admin 사용자가 함께 사용
+apiVersion: v1
+kind: Secret
+metadata:
+  name: otel-schema-init-credentials
+  namespace: clickhouse
+type: Opaque
+stringData:
+  user: schema_admin
+  password: change-me-schema-admin
+---
+apiVersion: clickhouse-keeper.altinity.com/v1
+kind: ClickHouseKeeperInstallation
+metadata:
+  name: otel-keeper
+  namespace: clickhouse
+spec:
+  defaults:
+    templates:
+      podTemplate: keeper
+      dataVolumeClaimTemplate: keeper-data
+      serviceTemplate: keeper-svc
+  configuration:
+    clusters:
+      - name: keeper
+        layout:
+          replicasCount: 3
+  templates:
+    podTemplates:
+      - name: keeper
+        spec:
+          affinity:
+            podAntiAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  podAffinityTerm:
+                    topologyKey: kubernetes.io/hostname
+                    labelSelector:
+                      matchLabels:
+                        clickhouse-keeper.altinity.com/chk: otel-keeper
+          containers:
+            - name: clickhouse-keeper
+              image: clickhouse/clickhouse-keeper:25.8
+              resources:
+                requests: {cpu: 250m, memory: 512Mi}
+                limits: {cpu: "1", memory: 2Gi}
+    volumeClaimTemplates:
+      - name: keeper-data
+        spec:
+          # storageClassName: <your-storage-class>
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+    serviceTemplates:
+      - name: keeper-svc
+        generateName: otel-keeper          # -> otel-keeper.clickhouse.svc:2181
+        spec:
+          type: ClusterIP
+          ports:
+            - name: zk
+              port: 2181
+---
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: otel-ch
+  namespace: clickhouse
+spec:
+  defaults:
+    templates:
+      podTemplate: clickhouse
+      dataVolumeClaimTemplate: data
+  configuration:
+    zookeeper:
+      nodes:
+        - host: otel-keeper.clickhouse.svc
+          port: 2181
+
+    clusters:
+      - name: logs
+        # 노드 간 Distributed / ON CLUSTER 쿼리 인증용 클러스터 시크릿 자동 생성
+        secret:
+          auto: "true"
+        layout:
+          shardsCount: 3
+          replicasCount: 2
+
+    users:
+      # ---- default: 비밀번호만 지정 (operator 가 넣는 기본 networks 제한은 그대로) ----
+      default/password:
+        valueFrom:
+          secretKeyRef: {name: clickhouse-user-passwords, key: default}
+
+      # ---- schema_admin: 스키마 초기화 Job 전용 (전체 권한, 클러스터 내부에서만 접속) ----
+      schema_admin/password:
+        valueFrom:
+          secretKeyRef: {name: otel-schema-init-credentials, key: password}
+      schema_admin/profile: default
+      schema_admin/quota: default
+      schema_admin/networks/ip:
+        - "10.0.0.0/8"          # 파드 CIDR 에 맞게 조정
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+
+      # ---- ltp_svc ----
+      ltp_svc/password:
+        valueFrom:
+          secretKeyRef: {name: clickhouse-user-passwords, key: ltp_svc}
+      ltp_svc/profile: default
+      ltp_svc/quota: default
+      ltp_svc/networks/ip: ["::/0"]   # 필요 시 접속 대역으로 제한
+      ltp_svc/grants/query:
+        - "GRANT SELECT, INSERT, SHOW ON ltp_svc.*"
+
+      # ---- ltp_audit ----
+      ltp_audit/password:
+        valueFrom:
+          secretKeyRef: {name: clickhouse-user-passwords, key: ltp_audit}
+      ltp_audit/profile: default
+      ltp_audit/quota: default
+      ltp_audit/networks/ip: ["::/0"]
+      ltp_audit/grants/query:
+        - "GRANT SELECT, INSERT, SHOW ON ltp_audit.*"
+
+      # ---- ltp_infra ----
+      ltp_infra/password:
+        valueFrom:
+          secretKeyRef: {name: clickhouse-user-passwords, key: ltp_infra}
+      ltp_infra/profile: default
+      ltp_infra/quota: default
+      ltp_infra/networks/ip: ["::/0"]
+      ltp_infra/grants/query:
+        - "GRANT SELECT, INSERT, SHOW ON ltp_infra.*"
+
+  templates:
+    podTemplates:
+      - name: clickhouse
+        spec:
+          affinity:
+            # 같은 shard 의 두 replica 가 한 노드에 몰리지 않도록 분산 (가능한 경우)
+            podAntiAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  podAffinityTerm:
+                    topologyKey: kubernetes.io/hostname
+                    labelSelector:
+                      matchLabels:
+                        clickhouse.altinity.com/chi: otel-ch
+          containers:
+            - name: clickhouse
+              image: clickhouse/clickhouse-server:25.8   # 또는 altinity/clickhouse-server (Altinity Stable)
+              resources:
+                requests: {cpu: "1", memory: 4Gi}
+                limits: {cpu: "4", memory: 16Gi}
+    volumeClaimTemplates:
+      - name: data
+        spec:
+          # storageClassName: <your-storage-class>
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 100Gi
